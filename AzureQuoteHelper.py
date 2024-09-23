@@ -263,15 +263,15 @@ def query_ai_model(prompt: str, message_history: list[dict]) -> str:
         system_message = (
             "You are an Azure pricing assistant. Your primary function is to help users with Azure VM pricing and recommendations. "
             "You can answer user questions about Azure VMs and pricing. "
-            "If a user asks for pricing, use the `get_azure_pricing` function to fetch the pricing information. "
+            "If a user asks for pricing of multiple VMs, call the `get_azure_pricing` function for each VM separately to fetch the pricing information. "
             "Here's how to respond:\n"
             "1. **Understand the request:** Determine if the user is asking a general question or requesting pricing.\n"
             "2. **Answer general questions:** Provide helpful information about Azure VMs based on your knowledge.\n"
             "3. **Handle pricing requests:** If the user asks for pricing, follow these steps:\n"
             "    - **Identify the request:** Clearly state what pricing the user is asking for (e.g., 'You want pricing for...').\n"
-            "    - **Extract the details:** Find the VM size, disk type, disk size (in GB), Azure region, and quantity.\n"
-            "    - **Call the function:** Call the `get_azure_pricing` function with the extracted details.\n"
-            "    - **Present the results:** Provide a clear pricing breakdown, including VM, disk, and total costs.\n"
+            "    - **Extract the details for each VM:** Find the VM size, disk type, disk size (in GB), Azure region, and quantity for each VM.\n"
+            "    - **Call the function for each VM:** Call the `get_azure_pricing` function separately for each VM with the extracted details.\n"
+            "    - **Present the results:** Provide a clear pricing breakdown, including VM, disk, and total costs in a table format for each VM. \n"
             "4. **Be concise and informative:** Keep your responses clear, concise, and helpful."
         )
 
@@ -285,64 +285,66 @@ def query_ai_model(prompt: str, message_history: list[dict]) -> str:
             messages=messages,
             tools=tools,
             tool_choice="auto",  # Allows the model to decide whether to call a tool
+            parallel_tool_calls=True # Allows the model to make parallel tool calls
         )
 
         response_message = response.choices[0].message
 
-        # Handle function call if present
+        # Handle function calls if present
         if response_message.tool_calls is not None:
-            # If the AI model decides to call a function
-            tool_call = response_message.tool_calls[0]
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
+            pricing_tables = [] # Store pricing tables for each VM
+            for tool_call in response_message.tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
 
-            logger.info(f"AI requested function: {function_name} with arguments: {function_args}")
+                logger.info(f"AI requested function: {function_name} with arguments: {function_args}")
 
-            if function_name == "get_azure_pricing":
-                # Validate parameters using Pydantic
-                try:
-                    pricing_params = GetAzurePricing(**function_args)
-                except ValidationError as ve:
-                    error_msg = f"Validation error for function arguments: {ve}"
-                    logger.error(error_msg)
-                    return error_msg
+                if function_name == "get_azure_pricing":
+                    # Validate parameters using Pydantic
+                    try:
+                        pricing_params = GetAzurePricing(**function_args)
+                    except ValidationError as ve:
+                        error_msg = f"Validation error for function arguments: {ve}"
+                        logger.error(error_msg)
+                        return error_msg
 
-                # Call the actual function
-                pricing_result = get_azure_pricing(
-                    vm_size=pricing_params.vm_size,
-                    disk_type=pricing_params.disk_type,
-                    disk_size=int(pricing_params.disk_size),  # Convert disk size to integer
-                    region=regions_mapping.get(pricing_params.region, pricing_params.region.lower()),  # Map region name
-                    quantity=pricing_params.quantity
-                )
+                    # Call the actual function
+                    pricing_result = get_azure_pricing(
+                        vm_size=pricing_params.vm_size,
+                        disk_type=pricing_params.disk_type,
+                        disk_size=int(pricing_params.disk_size),  # Convert disk size to integer
+                        region=regions_mapping.get(pricing_params.region, pricing_params.region.lower()),  # Map region name
+                        quantity=pricing_params.quantity
+                    )
 
-                if "error" in pricing_result:
-                    logger.error(f"Function call error: {pricing_result['error']}")
-                    return pricing_result["error"]
+                    if "error" in pricing_result:
+                        logger.error(f"Function call error: {pricing_result['error']}")
+                        return pricing_result["error"]
 
-                logger.info(f"Function call result: {pricing_result}")
+                    logger.info(f"Function call result: {pricing_result}")
 
-                # Format pricing results with dollar signs and two decimal places
-                for key, value in pricing_result.items():
-                    if isinstance(value, float):
-                        pricing_result[key] = f"${value:.2f}"
+                    # Format pricing results with dollar signs and two decimal places
+                    for key, value in pricing_result.items():
+                        if isinstance(value, float):
+                            pricing_result[key] = f"${value:.2f}"
 
-                # Format the pricing result into a table
-                pricing_table = (
-                    f"| Item | Price |\n"
-                    f"|---|---|\n"
-                    f"| VM Size | {pricing_result['vm_size']} |\n"
-                    f"| Disk Type | {pricing_result['disk_type']} |\n"
-                    f"| Disk Size | {pricing_result['disk_size']} |\n"
-                    f"| Region | {pricing_result['region']} |\n"
-                    f"| Quantity | {pricing_result['quantity']} |\n"
-                    f"| VM Price per Hour | {pricing_result['vm_price_per_hour']} |\n"
-                    f"| Disk Price per Hour | {pricing_result['disk_price_per_hour']} |\n"
-                    f"| Total Estimated Cost per Hour | {pricing_result['total_estimated_cost_per_hour']} |\n"
-                )
+                    # Format the pricing result into a table
+                    pricing_table = (
+                        f"| Item | Price |\n"
+                        f"|---|---|\n"
+                        f"| VM Size | {pricing_result['vm_size']} |\n"
+                        f"| Disk Type | {pricing_result['disk_type']} |\n"
+                        f"| Disk Size | {pricing_result['disk_size']} |\n"
+                        f"| Region | {pricing_result['region']} |\n"
+                        f"| Quantity | {pricing_result['quantity']} |\n"
+                        f"| VM Price per Hour | {pricing_result['vm_price_per_hour']} |\n"
+                        f"| Disk Price per Hour | {pricing_result['disk_price_per_hour']} |\n"
+                        f"| Total Estimated Cost per Hour | {pricing_result['total_estimated_cost_per_hour']} |\n"
+                    )
+                    pricing_tables.append(pricing_table)
 
-                # Add the pricing table to the message content
-                response_message.content = pricing_table if response_message.content is None else response_message.content + "\n\n" + pricing_table
+            # Add the pricing tables to the message content
+            response_message.content = "\n\n".join(pricing_tables) if response_message.content is None else response_message.content + "\n\n" + "\n\n".join(pricing_tables)
 
         # Return the AI's response, including any pricing details
         if response_message.content:
@@ -423,10 +425,9 @@ def handle_file_upload(uploaded_file, message_history):
             "- Network bandwidth\n"
             "- Application requirements (e.g., database, web server)\n"
             "- Expected workload and usage patterns\n\n"
-            f"Based on your analysis, recommend the most suitable Azure VM size, disk type, disk size (in GB), and region. "
+            f"Based on your analysis, recommend the most suitable Azure VM size, disk type, disk size (in GB), and region for both a File Server and a Domain Controller. "
             f"Extract all necessary parameters for the 'get_azure_pricing' function and call it to "
-            f"include the pricing information in your response.  Format your final response as a JSON object "
-            f"that includes both the recommendations and pricing details.\n\n"
+            f"include the pricing information in your response.  Ensure you provide a total monthly cost.  Format your final response in markdown, using headers for 'File Server', 'Domain Controller', 'Total Hourly Cost', and 'Total Daily Cost (for 24 hours)' and provide the pricing details in a table format under each header.  Also, provide a summary in paragraph form at the top of your response.\n\n"
             f"Document:\n{text}"
         )
 
@@ -440,7 +441,7 @@ def handle_file_upload(uploaded_file, message_history):
                 if "error" in recommendations_data:
                     st.error(recommendations_data["error"])
                 else:
-                    visualize_recommendations(recommendations_data)
+                    st.markdown(recommendations)
             except json.JSONDecodeError:
                 st.error("Failed to parse AI model's recommendation.")
         else:
@@ -568,16 +569,17 @@ def main():
         if st.button("Reset Chat"):
             st.session_state.messages = []  # Clear chat history
 
-        # Create a container with a scrollbar for the chat history
-        chat_container = st.container()
-        with chat_container:
-            # Display existing messages
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    if message["role"] == "function":
-                        st.markdown(f"**Function Response:**\n```json\n{message['content']}\n```")
-                    else:
-                        st.markdown(message["content"])
+        # Create an expandable container for the chat history
+        with st.expander("Chat History", expanded=True):
+            chat_container = st.container()
+            with chat_container:
+                # Display existing messages
+                for message in st.session_state.messages:
+                    with st.chat_message(message["role"]):
+                        if message["role"] == "function":
+                            st.markdown(f"**Function Response:**\n```json\n{message['content']}\n```")
+                        else:
+                            st.markdown(message["content"])
 
         # Chat input outside the chat history container
         with st.container():
