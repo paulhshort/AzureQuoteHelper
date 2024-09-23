@@ -13,7 +13,7 @@ from PyPDF2 import PdfReader
 from docx import Document
 import pandas as pd
 import plotly.express as px
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field
 import logging
 
 # Load environment variables from .env file
@@ -44,10 +44,11 @@ client = openai.OpenAI(
 
 # Define Pydantic model for Azure Pricing Function
 class GetAzurePricing(BaseModel):
-    vm_size: str
-    disk_type: str  # e.g., 'Premium SSD Managed Disks'
-    disk_size: str  # e.g., '400GB'
-    region: str
+    vm_size: str = Field(..., description="The size of the virtual machine (e.g., 'Standard_D4s_v3').")
+    disk_type: str = Field(..., description="The type of disk (e.g., 'Premium SSD'). Must be one of 'Standard HDD', 'Standard SSD', or 'Premium SSD'.")
+    disk_size: int = Field(..., description="The size of the disk in GB (e.g., 400).")
+    region: str = Field(..., description="The Azure region name (e.g., 'US East').")
+    quantity: int = Field(1, description="The quantity of VMs.")  # Default quantity is 1
 
 # Mapping for user-friendly region names to Azure's armRegionName
 regions_mapping = {
@@ -59,7 +60,7 @@ regions_mapping = {
     'South Central US': 'southcentralus',
     'East US 2': 'eastus2',
     'West Europe': 'westeurope',
-    'Australia East': 'australeast',  # Corrected typo
+    'Australia East': 'australeast',
     'Japan East': 'japaneast',
     'Southeast Asia': 'southeastasia',
     # Add more regions as needed
@@ -105,27 +106,29 @@ def fetch_available_vm_sizes(service_name: str, region: str):
 
 # Define the function that fetches Azure pricing based on parameters
 @st.cache_data(ttl=1800)  # Cache results for 30 minutes
-def get_azure_pricing(vm_size: str, disk_type: str, disk_size: str, region: str):
+def get_azure_pricing(vm_size: str, disk_type: str, disk_size: int, region: str, quantity: int = 1):
     """
     Fetch pricing information for a specific VM size with disk specifications in a given region.
 
     Parameters:
     - vm_size (str): The size of the virtual machine (e.g., 'Standard_D4s_v3').
-    - disk_type (str): The type of disk (e.g., 'Premium SSD Managed Disks').
-    - disk_size (str): The size of the disk (e.g., '400GB').
+    - disk_type (str): The type of disk (e.g., 'Premium SSD').
+    - disk_size (int): The size of the disk in GB (e.g., 400).
     - region (str): The Azure region code (e.g., 'eastus').
+    - quantity (int): The quantity of VMs (default is 1).
 
     Returns:
     - dict: A dictionary containing VM price, Disk price, and Total estimated cost.
     """
     try:
-        logger.info(f"Fetching pricing for VM Size: {vm_size}, Disk Type: {disk_type}, Disk Size: {disk_size}, Region: {region}")
+        logger.info(f"Pricing Lookup - Service: Virtual Machines, VM Size: {vm_size}, Disk Type: {disk_type}, Disk Size: {disk_size}GB, Region: {region}, Quantity: {quantity}")
+        logger.info(f"Fetching pricing for VM Size: {vm_size}, Disk Type: {disk_type}, Disk Size: {disk_size}GB, Region: {region}, Quantity: {quantity}")
 
         # Fetch VM pricing
         vm_filter = f"serviceName eq 'Virtual Machines' and armSkuName eq '{vm_size}' and armRegionName eq '{region}' and priceType eq 'Consumption'"
         vm_params = {
             "$filter": vm_filter,
-            "$top": 1000,
+            "$top": 1,  # Only need the first match
             "api-version": "2023-01-01-preview"
         }
         vm_response = requests.get(AZURE_PRICING_API_URL, params=vm_params)
@@ -137,7 +140,6 @@ def get_azure_pricing(vm_size: str, disk_type: str, disk_size: str, region: str)
             logger.debug(f"API Response: {vm_response.text}")
             return {"error": error_msg}
 
-        # Assume the first matched item is the desired one
         vm_price = float(vm_data[0].get('unitPrice', 0))
         currency = vm_data[0].get('currencyCode', 'USD')
         logger.info(f"VM Price: {vm_price} {currency} per hour")
@@ -147,7 +149,7 @@ def get_azure_pricing(vm_size: str, disk_type: str, disk_size: str, region: str)
         disk_filter = f"serviceName eq 'Storage' and productName eq '{disk_product}' and armRegionName eq '{region}' and priceType eq 'Consumption'"
         disk_params = {
             "$filter": disk_filter,
-            "$top": 1000,
+            "$top": 1,  # Only need the first match
             "api-version": "2023-01-01-preview"
         }
         disk_response = requests.get(AZURE_PRICING_API_URL, params=disk_params)
@@ -159,35 +161,25 @@ def get_azure_pricing(vm_size: str, disk_type: str, disk_size: str, region: str)
             logger.debug(f"API Response: {disk_response.text}")
             return {"error": error_msg}
 
-        # Assume the first matched item is the desired one
-        disk_price_per_GB = float(disk_data[0].get('unitPrice', 0))
-        logger.info(f"Disk Price per GB: {disk_price_per_GB} {currency}")
-
-        # Extract numeric value from disk_size (e.g., '400GB' -> 400)
-        disk_size_numeric_match = re.search(r'(\d+\.?\d*)', disk_size)
-        if disk_size_numeric_match:
-            disk_size_numeric = float(disk_size_numeric_match.group(1))
-        else:
-            error_msg = f"Invalid disk size format: '{disk_size}'. Expected format like '400GB'."
-            logger.error(error_msg)
-            return {"error": error_msg}
-
-        disk_price = disk_price_per_GB * disk_size_numeric
-        logger.info(f"Disk Price per Hour: {disk_price} {currency}")
+        # Calculate disk price per hour based on monthly price per GB
+        disk_price_per_GB_month = float(disk_data[0].get('unitPrice', 0))
+        disk_price_per_hour = disk_price_per_GB_month * disk_size / (30 * 24)  # Assume 30 days in a month
+        logger.info(f"Disk Price per Hour: {disk_price_per_hour} {currency}")
 
         # Total estimated cost
-        total_cost = vm_price + disk_price
+        total_cost = (vm_price + disk_price_per_hour) * quantity
         logger.info(f"Total Estimated Cost per Hour: {total_cost} {currency}")
 
         return {
             "vm_size": vm_size,
             "vm_price_per_hour": vm_price,
             "disk_type": disk_type,
-            "disk_size": disk_size,
-            "disk_price_per_GB": disk_price_per_GB,
-            "disk_price_per_hour": disk_price,
+            "disk_size": f"{disk_size}GB",
+            "disk_price_per_GB_month": disk_price_per_GB_month,
+            "disk_price_per_hour": disk_price_per_hour,
             "region": region,
             "currency": currency,
+            "quantity": quantity,
             "total_estimated_cost_per_hour": total_cost
         }
     except requests.exceptions.HTTPError as http_err:
@@ -203,7 +195,39 @@ def get_azure_pricing(vm_size: str, disk_type: str, disk_size: str, region: str)
         logger.error(error_msg)
         return {"error": error_msg}
 
-# Define the tool for function calling using pydantic_function_tool
+# Define the OpenAPI schema for the get_azure_pricing function
+get_azure_pricing_schema = {
+    "name": "get_azure_pricing",
+    "description": "Get the estimated hourly cost of an Azure Virtual Machine.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "vm_size": {
+                "type": "string",
+                "description": "The size of the virtual machine (e.g., 'Standard_D4s_v3').",
+            },
+            "disk_type": {
+                "type": "string",
+                "description": "The type of disk (e.g., 'Premium SSD'). Must be one of 'Standard HDD', 'Standard SSD', or 'Premium SSD'.",
+            },
+            "disk_size": {
+                "type": "integer",  # Corrected data type to integer
+                "description": "The size of the disk in GB (e.g., 400).",
+            },
+            "region": {
+                "type": "string",
+                "description": "The Azure region name (e.g., 'US East').",
+            },
+            "quantity": {
+                "type": "integer",
+                "description": "The quantity of VMs (default is 1).",
+            },
+        },
+        "required": ["vm_size", "disk_type", "disk_size", "region"],
+    },
+}
+
+# Define the tool for function calling using the OpenAPI schema
 def define_tools():
     """
     Define the tools/functions that the AI model can call.
@@ -212,44 +236,66 @@ def define_tools():
     - list: A list of tool definitions compatible with OpenRouter.
     """
     return [
-        openai.pydantic_function_tool(GetAzurePricing, name="get_azure_pricing"),
+        {
+            "type": "function",
+            "function": get_azure_pricing_schema,
+        },
     ]
 
 # Function to handle AI model queries with function calling
-def query_ai_model(prompt: str):
+def query_ai_model(prompt: str, message_history: list[dict]) -> str:
     """
-    Query the AI model with function calling capability.
+    Query the AI model with function calling capability, considering message history.
 
     Parameters:
     - prompt (str): The user-provided prompt/question.
+    - message_history (list[dict]): The history of messages in the chat.
 
     Returns:
-    - str: The AI model's response.
+    - str: The AI model's response, or pricing data as a dictionary.
     """
     try:
         tools = define_tools()
 
         logger.info(f"Sending prompt to AI: {prompt}")
 
+        # Enhanced prompt to guide the model
+        system_message = (
+            "You are an Azure pricing assistant. Your primary function is to help users with Azure VM pricing and recommendations. "
+            "You can answer user questions about Azure VMs and pricing. "
+            "If a user asks for pricing, use the `get_azure_pricing` function to fetch the pricing information. "
+            "Here's how to respond:\n"
+            "1. **Understand the request:** Determine if the user is asking a general question or requesting pricing.\n"
+            "2. **Answer general questions:** Provide helpful information about Azure VMs based on your knowledge.\n"
+            "3. **Handle pricing requests:** If the user asks for pricing, follow these steps:\n"
+            "    - **Identify the request:** Clearly state what pricing the user is asking for (e.g., 'You want pricing for...').\n"
+            "    - **Extract the details:** Find the VM size, disk type, disk size (in GB), Azure region, and quantity.\n"
+            "    - **Call the function:** Call the `get_azure_pricing` function with the extracted details.\n"
+            "    - **Present the results:** Provide a clear pricing breakdown, including VM, disk, and total costs.\n"
+            "4. **Be concise and informative:** Keep your responses clear, concise, and helpful."
+        )
+
+        # Add message history to the messages list
+        messages = message_history + [{"role": "system", "content": system_message},
+                                      {"role": "user", "content": prompt}]
+
         # Initial AI request
         response = client.chat.completions.create(
             model="openai/gpt-4o-2024-08-06",
-            messages=[
-                {"role": "system", "content": "You are an Azure pricing assistant. Use the get_azure_pricing function to fetch pricing information when needed."},
-                {"role": "user", "content": prompt}
-            ],
+            messages=messages,
             tools=tools,
             tool_choice="auto",  # Allows the model to decide whether to call a tool
-            parallel_tool_calls=True
         )
 
-        message = response.choices[0].message
-        logger.info(f"Received message from AI: {message.content}")
+        response_message = response.choices[0].message
 
-        # If the AI model decides to call a function
-        if hasattr(message, "function_call") and message.function_call:
-            function_name = message.function_call.name
-            function_args = json.loads(message.function_call.arguments)
+        # Handle function call if present
+        if response_message.tool_calls is not None:
+            # If the AI model decides to call a function
+            tool_call = response_message.tool_calls[0]
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+
             logger.info(f"AI requested function: {function_name} with arguments: {function_args}")
 
             if function_name == "get_azure_pricing":
@@ -265,8 +311,9 @@ def query_ai_model(prompt: str):
                 pricing_result = get_azure_pricing(
                     vm_size=pricing_params.vm_size,
                     disk_type=pricing_params.disk_type,
-                    disk_size=pricing_params.disk_size,
-                    region=pricing_params.region
+                    disk_size=int(pricing_params.disk_size),  # Convert disk size to integer
+                    region=regions_mapping.get(pricing_params.region, pricing_params.region.lower()),  # Map region name
+                    quantity=pricing_params.quantity
                 )
 
                 if "error" in pricing_result:
@@ -274,35 +321,15 @@ def query_ai_model(prompt: str):
                     return pricing_result["error"]
 
                 logger.info(f"Function call result: {pricing_result}")
+                
+                # Format the pricing result and add it to the message content
+                formatted_pricing = f"**Pricing Details:**\n```json\n{json.dumps(pricing_result, indent=2)}\n```"
+                response_message.content = formatted_pricing if response_message.content is None else response_message.content + "\n\n" + formatted_pricing
 
-                # Prepare the function response
-                tool_response = {
-                    "role": "function",
-                    "name": "get_azure_pricing",
-                    "content": json.dumps(pricing_result)
-                }
-
-                # Second AI request with function response
-                second_response = client.chat.completions.create(
-                    model="openai/gpt-4o-2024-08-06",
-                    messages=[
-                        {"role": "system", "content": "You are an Azure pricing assistant."},
-                        {"role": "user", "content": prompt},
-                        tool_response
-                    ],
-                    tools=tools,
-                    tool_choice="auto",
-                    parallel_tool_calls=True
-                )
-
-                final_message = second_response.choices[0].message.content
-                logger.info(f"Final response from AI: {final_message}")
-                return final_message
-
-        # If no function call, return the AI's direct response
-        if hasattr(message, "content") and message.content:
-            logger.info(f"AI provided response: {message.content}")
-            return message.content
+        # Return the AI's response, including any pricing details
+        if response_message.content:
+            logger.info(f"AI provided response: {response_message.content}")
+            return response_message.content
         else:
             logger.warning("AI response content is None.")
             return "Sorry, I couldn't process your request."
@@ -343,7 +370,7 @@ def visualize_recommendations(recommendations: dict):
         x=["VM Price per Hour", "Disk Price per Hour", "Total Estimated Cost per Hour"],
         y=[df["vm_price_per_hour"].iloc[0], df["disk_price_per_hour"].iloc[0], df["total_estimated_cost_per_hour"].iloc[0]],
         labels={"x": "Cost Component", "y": f"Price ({df['currency'].iloc[0]})"},
-        title=f"Pricing Breakdown for {df['vm_size'].iloc[0]} with {df['disk_size'].iloc[0]} in {df['region'].iloc[0]}"
+        title=f"Pricing Breakdown for {df['quantity'].iloc[0]} x {df['vm_size'].iloc[0]} with {df['disk_size'].iloc[0]} in {df['region'].iloc[0]}"
     )
     fig.update_traces(texttemplate='$%{y:.4f}', textposition='outside')
     fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
@@ -354,39 +381,48 @@ def visualize_recommendations(recommendations: dict):
     st.json(recommendations)
 
 # Function to handle file uploads and generate VM recommendations
-def handle_file_upload(uploaded_file):
+def handle_file_upload(uploaded_file, message_history):
     """
     Handle the uploaded file to extract text and generate VM recommendations.
 
     Parameters:
     - uploaded_file: The uploaded PDF or DOCX file.
+    - message_history (list[dict]): The history of messages in the chat.
     """
     text = extract_text_from_file(uploaded_file)
     if not text:
         st.error("Failed to extract text from the uploaded file.")
         return
 
-    with st.spinner("Analyzing quote and generating VM recommendations..."):
+    with st.spinner("Analyzing document and generating VM recommendations..."):
         # Example prompt: Customize based on how the AI should interpret the text
         prompt = (
-            f"Analyze the following quote and identify the virtual machine configurations and performance requirements. "
-            f"Based on this analysis, recommend the most suitable Azure VM size, disk type, disk size, and region. "
-            f"Provide the recommendations in a JSON format adhering to the following schema:\n\n"
-            f"{json.dumps(GetAzurePricing.schema(), indent=2)}\n\n"
-            f"Quote:\n{text}"
+            f"Analyze the following document, focusing on technical specifications and requirements. "
+            f"Identify details relevant to an Azure VM migration, such as:\n"
+            "- CPU cores and speed\n"
+            "- RAM\n"
+            "- Storage capacity and type (HDD, SSD)\n"
+            "- Network bandwidth\n"
+            "- Application requirements (e.g., database, web server)\n"
+            "- Expected workload and usage patterns\n\n"
+            f"Based on your analysis, recommend the most suitable Azure VM size, disk type, disk size (in GB), and region. "
+            f"Extract all necessary parameters for the 'get_azure_pricing' function and call it to "
+            f"include the pricing information in your response.  Format your final response as a JSON object "
+            f"that includes both the recommendations and pricing details.\n\n"
+            f"Document:\n{text}"
         )
 
         # Query the AI model
-        recommendation = query_ai_model(prompt)
+        recommendations = query_ai_model(prompt, message_history)
 
         # Display and visualize the recommendations
-        if recommendation:
+        if recommendations:
             try:
-                recommendation_data = json.loads(recommendation)
-                if "error" in recommendation_data:
-                    st.error(recommendation_data["error"])
+                recommendations_data = json.loads(recommendations) if isinstance(recommendations, str) else recommendations
+                if "error" in recommendations_data:
+                    st.error(recommendations_data["error"])
                 else:
-                    visualize_recommendations(recommendation_data)
+                    visualize_recommendations(recommendations_data)
             except json.JSONDecodeError:
                 st.error("Failed to parse AI model's recommendation.")
         else:
@@ -423,50 +459,6 @@ def extract_text_from_file(file):
         st.error(f"Error reading file: {e}")
         return None
 
-# Streamlit Chat Interface
-def chat_interface():
-    """
-    Interactive chat interface with the AI assistant for real-time queries.
-    """
-    st.header("Chat with Azure Pricing Assistant")
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    # Display existing messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "function":
-                st.markdown(f"**Function Response:**\n```json\n{message['content']}\n```")
-            else:
-                st.markdown(message["content"])
-
-    # Input for new message
-    if prompt := st.chat_input("Ask about Azure pricing or VM recommendations"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            response = query_ai_model(prompt)
-            if response:
-                # Check if response is a JSON object (structured)
-                if isinstance(response, str) and response.strip().startswith("{") and response.strip().endswith("}"):
-                    try:
-                        parsed_response = json.loads(response)
-                        formatted_response = json.dumps(parsed_response, indent=2)
-                        message_placeholder.markdown(f"```json\n{formatted_response}\n```")
-                    except json.JSONDecodeError:
-                        # If not a valid JSON, display as is
-                        message_placeholder.markdown(response)
-                else:
-                    message_placeholder.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
-            else:
-                message_placeholder.markdown("Sorry, I couldn't process your request.")
-                st.session_state.messages.append({"role": "assistant", "content": "Sorry, I couldn't process your request."})
-
 # Streamlit Main Function
 def main():
     """
@@ -479,47 +471,48 @@ def main():
     Additionally, you can query Azure pricing information and interact with our AI-powered assistant for real-time support.
     """)
 
-    # File Uploader Section
-    st.subheader("Upload Quote Document for VM Recommendations")
-    uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
+    # Initialize chat history in session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    if uploaded_file:
-        handle_file_upload(uploaded_file)
+    # Create two columns
+    col1, col2 = st.columns(2)
 
-    # Azure Pricing Lookup Section (Sidebar)
-    st.sidebar.header("Azure Pricing Lookup")
-    service_name = st.sidebar.selectbox("Select Azure Service Name", ["Virtual Machines"])  # Expandable for more services
-    if service_name == "Virtual Machines":
-        # Select Azure Region
-        region_input = st.sidebar.selectbox("Select Azure Region", list(regions_mapping.keys()), index=0)
-        region = regions_mapping.get(region_input, region_input.lower())
+    # Azure Pricing Lookup Section (Column 1)
+    with col1:
+        st.header("Azure Pricing Lookup")
+        service_name = st.selectbox("Select Azure Service Name", ["Virtual Machines"])  # Expandable for more services
+        if service_name == "Virtual Machines":
+            # Select Azure Region
+            region_input = st.selectbox("Select Azure Region", list(regions_mapping.keys()), index=0)
+            region = regions_mapping.get(region_input, region_input.lower())
 
-        # Fetch available VM sizes based on service and region
-        vm_sizes = fetch_available_vm_sizes(service_name, region)
-        if not vm_sizes:
-            st.sidebar.warning("No VM sizes available for the selected service and region.")
-        else:
-            vm_size = st.sidebar.selectbox("Select VM Size", vm_sizes)
+            # Fetch available VM sizes based on service and region
+            vm_sizes = fetch_available_vm_sizes(service_name, region)
+            if not vm_sizes:
+                st.warning("No VM sizes available for the selected service and region.")
+            else:
+                vm_size = st.selectbox("Select VM Size", vm_sizes)
 
-            # Select Disk Type
-            disk_type = st.sidebar.selectbox("Select Disk Type", ["Standard HDD", "Standard SSD", "Premium SSD"])
+                # Select Disk Type
+                disk_type = st.selectbox("Select Disk Type", list(disk_product_mapping.keys()))
 
-            # Input Disk Size
-            disk_size = st.sidebar.text_input("Enter Disk Size (e.g., '400GB')", value="400GB")
+                # Input Disk Size
+                disk_size = st.number_input("Enter Disk Size (GB)", min_value=1, value=400)
 
-            # Handle Pricing Fetching
-            if st.sidebar.button("Fetch Pricing"):
-                if not isinstance(disk_size, str) or not re.match(r'^\d+(\.\d+)?GB$', disk_size.strip(), re.IGNORECASE):
-                    st.sidebar.error("Please enter a valid disk size in the format like '400GB'.")
-                else:
+                # Input Quantity
+                quantity = st.number_input("Quantity", min_value=1, value=1)
+
+                # Handle Pricing Fetching
+                if st.button("Fetch Pricing"):
                     with st.spinner("Fetching pricing data..."):
                         # Call the pricing function
-                        pricing_result = get_azure_pricing(vm_size, disk_type, disk_size, region)
+                        pricing_result = get_azure_pricing(vm_size, disk_type, disk_size, region, quantity)
                         if "error" in pricing_result:
-                            st.sidebar.error(pricing_result["error"])
+                            st.error(pricing_result["error"])
                         else:
-                            st.sidebar.subheader(f"Pricing for {vm_size} with {disk_size} {disk_type} in {region_input}")
-                            st.sidebar.json(pricing_result)
+                            st.subheader(f"Pricing for {quantity} x {vm_size} with {disk_size}GB {disk_type} in {region_input}")
+                            st.json(pricing_result)
 
                             # Visualization
                             df = pd.DataFrame([pricing_result])
@@ -527,14 +520,66 @@ def main():
                                 x=["VM Price per Hour", "Disk Price per Hour", "Total Estimated Cost per Hour"],
                                 y=[df["vm_price_per_hour"].iloc[0], df["disk_price_per_hour"].iloc[0], df["total_estimated_cost_per_hour"].iloc[0]],
                                 labels={"x": "Cost Component", "y": f"Price ({df['currency'].iloc[0]})"},
-                                title=f"Pricing Breakdown for {vm_size} with {disk_size} {disk_type} in {region_input}"
+                                title=f"Pricing Breakdown for {quantity} x {vm_size} with {disk_size}GB {disk_type} in {region_input}"
                             )
                             fig.update_traces(texttemplate='$%{y:.4f}', textposition='outside')
                             fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
-                            st.sidebar.plotly_chart(fig)
+                            st.plotly_chart(fig)
 
-    # Chat Interface Section
-    chat_interface()
+                # Handle Add to Chat
+                if st.button("Add to Chat"):
+                    with st.spinner("Fetching pricing data and adding to chat..."):
+                        pricing_result = get_azure_pricing(vm_size, disk_type, disk_size, region, quantity)
+                        if "error" in pricing_result:
+                            st.error(pricing_result["error"])
+                        else:
+                            # Add pricing data to chat history
+                            st.session_state.messages.append({"role": "assistant", "content": pricing_result})
+
+    # AI Chat Interface (Column 2)
+    with col2:
+        st.header("Chat with Azure Pricing Assistant")
+        
+        # Create a container with a scrollbar for the chat history
+        chat_container = st.container()
+        with chat_container:
+            # Display existing messages
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    if message["role"] == "function":
+                        st.markdown(f"**Function Response:**\n```json\n{message['content']}\n```")
+                    else:
+                        st.markdown(message["content"])
+
+        # Chat input outside the chat history container
+        with st.container():
+            if prompt := st.chat_input("Ask about Azure pricing or VM recommendations"):
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with chat_container:  # Add new messages inside the chat_container
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+
+                    with st.chat_message("assistant"):
+                        message_placeholder = st.empty()
+                        response = query_ai_model(prompt, st.session_state.messages)
+                        if response:
+                            if isinstance(response, dict):  # Check if response is a dictionary (pricing data)
+                                # Format and display pricing data
+                                message_placeholder.markdown(f"**Pricing Details:**\n```json\n{json.dumps(response, indent=2)}\n```")
+                            else:  # Assume it's a regular text response
+                                message_placeholder.markdown(response)
+                            if response is not None:  # Only append if response is not None
+                                st.session_state.messages.append({"role": "assistant", "content": response})
+                        else:
+                            message_placeholder.markdown("Sorry, I couldn't process your request.")
+                            st.session_state.messages.append({"role": "assistant", "content": "Sorry, I couldn't process your request."})
+
+    # File Uploader Section
+    st.subheader("Upload Document for VM Recommendations")
+    uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
+
+    if uploaded_file:
+        handle_file_upload(uploaded_file, st.session_state.messages)
 
 if __name__ == "__main__":
     main()
