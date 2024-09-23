@@ -8,3 +8,6 @@ python-dotenv
 markdown
 plotly
 pandas
+pydantic
+plotly.express
+docx
