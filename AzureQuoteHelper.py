@@ -252,7 +252,7 @@ def query_ai_model(prompt: str, message_history: list[dict]) -> str:
     - message_history (list[dict]): The history of messages in the chat.
 
     Returns:
-    - str: The AI model's response, or pricing data as a dictionary.
+    - str: The AI model's response.
     """
     try:
         tools = define_tools()
@@ -321,10 +321,28 @@ def query_ai_model(prompt: str, message_history: list[dict]) -> str:
                     return pricing_result["error"]
 
                 logger.info(f"Function call result: {pricing_result}")
-                
-                # Format the pricing result and add it to the message content
-                formatted_pricing = f"**Pricing Details:**\n```json\n{json.dumps(pricing_result, indent=2)}\n```"
-                response_message.content = formatted_pricing if response_message.content is None else response_message.content + "\n\n" + formatted_pricing
+
+                # Format pricing results with dollar signs and two decimal places
+                for key, value in pricing_result.items():
+                    if isinstance(value, float):
+                        pricing_result[key] = f"${value:.2f}"
+
+                # Format the pricing result into a table
+                pricing_table = (
+                    f"| Item | Price |\n"
+                    f"|---|---|\n"
+                    f"| VM Size | {pricing_result['vm_size']} |\n"
+                    f"| Disk Type | {pricing_result['disk_type']} |\n"
+                    f"| Disk Size | {pricing_result['disk_size']} |\n"
+                    f"| Region | {pricing_result['region']} |\n"
+                    f"| Quantity | {pricing_result['quantity']} |\n"
+                    f"| VM Price per Hour | {pricing_result['vm_price_per_hour']} |\n"
+                    f"| Disk Price per Hour | {pricing_result['disk_price_per_hour']} |\n"
+                    f"| Total Estimated Cost per Hour | {pricing_result['total_estimated_cost_per_hour']} |\n"
+                )
+
+                # Add the pricing table to the message content
+                response_message.content = pricing_table if response_message.content is None else response_message.content + "\n\n" + pricing_table
 
         # Return the AI's response, including any pricing details
         if response_message.content:
@@ -361,9 +379,9 @@ def visualize_recommendations(recommendations: dict):
         return
 
     # Convert pricing columns to numeric
-    df["vm_price_per_hour"] = pd.to_numeric(df["vm_price_per_hour"], errors='coerce')
-    df["disk_price_per_hour"] = pd.to_numeric(df["disk_price_per_hour"], errors='coerce')
-    df["total_estimated_cost_per_hour"] = pd.to_numeric(df["total_estimated_cost_per_hour"], errors='coerce')
+    df["vm_price_per_hour"] = pd.to_numeric(df["vm_price_per_hour"].str.replace('$', ''), errors='coerce')
+    df["disk_price_per_hour"] = pd.to_numeric(df["disk_price_per_hour"].str.replace('$', ''), errors='coerce')
+    df["total_estimated_cost_per_hour"] = pd.to_numeric(df["total_estimated_cost_per_hour"].str.replace('$', ''), errors='coerce')
 
     # Bar chart for VM and Disk Prices
     fig = px.bar(
@@ -372,7 +390,7 @@ def visualize_recommendations(recommendations: dict):
         labels={"x": "Cost Component", "y": f"Price ({df['currency'].iloc[0]})"},
         title=f"Pricing Breakdown for {df['quantity'].iloc[0]} x {df['vm_size'].iloc[0]} with {df['disk_size'].iloc[0]} in {df['region'].iloc[0]}"
     )
-    fig.update_traces(texttemplate='$%{y:.4f}', textposition='outside')
+    fig.update_traces(texttemplate='$%{y:.2f}', textposition='outside')
     fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
     st.plotly_chart(fig)
 
@@ -481,6 +499,14 @@ def main():
     # Azure Pricing Lookup Section (Column 1)
     with col1:
         st.header("Azure Pricing Lookup")
+
+        # File Uploader Section
+        st.subheader("Upload Document for VM Recommendations")
+        uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
+
+        if uploaded_file:
+            handle_file_upload(uploaded_file, st.session_state.messages)
+
         service_name = st.selectbox("Select Azure Service Name", ["Virtual Machines"])  # Expandable for more services
         if service_name == "Virtual Machines":
             # Select Azure Region
@@ -522,7 +548,7 @@ def main():
                                 labels={"x": "Cost Component", "y": f"Price ({df['currency'].iloc[0]})"},
                                 title=f"Pricing Breakdown for {quantity} x {vm_size} with {disk_size}GB {disk_type} in {region_input}"
                             )
-                            fig.update_traces(texttemplate='$%{y:.4f}', textposition='outside')
+                            fig.update_traces(texttemplate='$%{y:.2f}', textposition='outside')
                             fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
                             st.plotly_chart(fig)
 
@@ -539,7 +565,9 @@ def main():
     # AI Chat Interface (Column 2)
     with col2:
         st.header("Chat with Azure Pricing Assistant")
-        
+        if st.button("Reset Chat"):
+            st.session_state.messages = []  # Clear chat history
+
         # Create a container with a scrollbar for the chat history
         chat_container = st.container()
         with chat_container:
@@ -564,6 +592,10 @@ def main():
                         response = query_ai_model(prompt, st.session_state.messages)
                         if response:
                             if isinstance(response, dict):  # Check if response is a dictionary (pricing data)
+                                # Format pricing results with dollar signs and two decimal places
+                                for key, value in response.items():
+                                    if isinstance(value, float):
+                                        response[key] = f"${value:.2f}"
                                 # Format and display pricing data
                                 message_placeholder.markdown(f"**Pricing Details:**\n```json\n{json.dumps(response, indent=2)}\n```")
                             else:  # Assume it's a regular text response
@@ -573,13 +605,6 @@ def main():
                         else:
                             message_placeholder.markdown("Sorry, I couldn't process your request.")
                             st.session_state.messages.append({"role": "assistant", "content": "Sorry, I couldn't process your request."})
-
-    # File Uploader Section
-    st.subheader("Upload Document for VM Recommendations")
-    uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
-
-    if uploaded_file:
-        handle_file_upload(uploaded_file, st.session_state.messages)
 
 if __name__ == "__main__":
     main()
